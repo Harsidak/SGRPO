@@ -1,0 +1,39 @@
+CLAUDE.md
+CLAUDE/
+Docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Checkpoints and models
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# Wandb
+wandb/
+
+# Results
+Experiments/results/
+*.json
+!package.json
+!tsconfig.json
+
+# OS and Archives
+*.exe*
+*.pdf
+*.zip
+*.tar.gz
+.DS_Store
+Thumbs.db
+
+# research folders (containg the research work)
+Papers/
+sgrpo_research_roadmap.md
