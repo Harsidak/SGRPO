@@ -73,8 +73,24 @@ class BaseTrainer:
             eval_dataset, "compute_group_rewards", compute_group_rewards
         )
         self.arch = arch
-        self.device = config.device
         self.step = 0
+
+        # ── Optional multi-GPU via HuggingFace Accelerate ────────────────
+        # When enabled (accelerate launch ... --use_accelerate), Accelerate
+        # owns device placement, DDP wrapping, and mixed precision. When
+        # disabled, everything below reduces to plain single-device PyTorch
+        # so local runs are bit-identical to the pre-Accelerate trainer.
+        if config.use_accelerate:
+            from accelerate import Accelerator
+            self.accelerator = Accelerator(
+                mixed_precision=(
+                    "bf16" if config.dtype == "bfloat16" else "no"
+                ),
+            )
+            self.device = str(self.accelerator.device)
+        else:
+            self.accelerator = None
+            self.device = config.device
 
         # Select rollout generator
         # SGRPO uses state-isolated rollouts — this is the novel contribution.
@@ -102,8 +118,10 @@ class BaseTrainer:
         # Required by RLHF PPO (InstructGPT), GRPO (DeepSeekMath), and BAPO.
         # DAPO removes it by design; SGRPO replaces it with Future-KL
         # weighting computed from stored rollout log-probs (no second model).
+        # Deepcopy happens BEFORE accelerator.prepare() so the reference is
+        # the bare (non-DDP-wrapped) module.
         if algorithm in ("ppo", "grpo", "bapo"):
-            self._ref_model = copy.deepcopy(model)
+            self._ref_model = copy.deepcopy(model).to(self.device)
             self._ref_model.eval()
             for p in self._ref_model.parameters():
                 p.requires_grad_(False)
@@ -111,6 +129,18 @@ class BaseTrainer:
                   f"(kl_coef={config.kl_coef})")
         else:
             self._ref_model = None
+
+        # Under Accelerate the model comes back DDP-wrapped: gradient
+        # forward/backward must go through self.model, but generation
+        # (rollouts, eval) needs the bare module — DDP does not expose
+        # generate() and adds no value inside torch.no_grad().
+        if self.accelerator is not None:
+            self.model, self.optimizer = self.accelerator.prepare(
+                self.model, self.optimizer
+            )
+            self._gen_model = self.accelerator.unwrap_model(self.model)
+        else:
+            self._gen_model = self.model
 
         # PPO advantage baseline. PPO runs with group_size=1, so
         # group-relative statistics are undefined (std of one sample is
@@ -126,8 +156,8 @@ class BaseTrainer:
         self._all_response_lengths = []
         self._sample_buffer = []     # for sample generation tables
 
-        # W&B init
-        if not config.no_wandb:
+        # W&B init — main process only under multi-GPU
+        if not config.no_wandb and self._is_main:
             init_run(
                 algorithm=algorithm,
                 run_name=config.run_name,
@@ -138,9 +168,52 @@ class BaseTrainer:
         # Checkpoint dir
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-        print(f"Trainer initialized: {algorithm.upper()} | arch: {arch}")
-        print(f"Rollout generator: "
-              f"{'isolated (SGRPO)' if self.rollout_fn is generate_rollouts_isolated else 'standard'}")
+        if self._is_main:
+            print(f"Trainer initialized: {algorithm.upper()} | arch: {arch}")
+            print(f"Rollout generator: "
+                  f"{'isolated (SGRPO)' if self.rollout_fn is generate_rollouts_isolated else 'standard'}")
+            if self.accelerator is not None:
+                print(f"Accelerate: {self.accelerator.num_processes} "
+                      f"process(es), device {self.device}, "
+                      f"mixed_precision={self.accelerator.mixed_precision}")
+
+    @property
+    def _is_main(self) -> bool:
+        """True on the main process (always True without Accelerate)."""
+        return self.accelerator.is_main_process if self.accelerator else True
+
+    def _zero_backward(self, anchor: torch.Tensor) -> None:
+        """
+        Backward a zero-valued surrogate through the existing forward graph.
+
+        Under DDP every rank must run backward every microbatch, or the
+        gradient all-reduce collectives desynchronize (hang) and the
+        grad-accum counters drift apart (silent weight divergence). A rank
+        that skips a step (degenerate group, non-finite loss) therefore
+        contributes an explicit zero gradient instead of skipping backward.
+
+        nan_to_num guards the non-finite-loss case: 0 * inf = NaN, so the
+        anchor must be sanitized before the zero-multiply.
+        """
+        self.accelerator.backward(anchor.nan_to_num().sum() * 0.0)
+
+    def _clip_grads(self) -> float:
+        """Clip gradients, via Accelerate when active (handles DDP/AMP)."""
+        if self.accelerator is not None:
+            return self.accelerator.clip_grad_norm_(
+                self.model.parameters(), self.config.max_grad_norm
+            ).item()
+        return torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=self.config.max_grad_norm
+        ).item()
+
+    def _step_if_boundary(self, accumulation_count: int) -> None:
+        """Optimizer step at the grad-accum boundary (skip-path variant —
+        the normal path steps inline where it also logs)."""
+        if accumulation_count % self.config.grad_accum == 0:
+            self._clip_grads()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
     def _compute_new_log_probs_and_entropy(
         self,
@@ -251,8 +324,14 @@ class BaseTrainer:
 
         elif self.algorithm == "bapo":
             result = bapo_loss.compute(
-                new_log_probs, old_log_probs, rewards,
-                attention_mask, self.config.clip_eps,
+                new_log_probs, old_log_probs, rewards, attention_mask,
+                c_low_min=self.config.bapo_c_low_min,
+                c_low_max=self.config.bapo_c_low_max,
+                c_high_min=self.config.bapo_c_high_min,
+                c_high_max=self.config.bapo_c_high_max,
+                delta_high=self.config.bapo_delta_high,
+                delta_low=self.config.bapo_delta_low,
+                rho_target=self.config.bapo_rho_target,
                 ref_log_probs=ref_log_probs, kl_coef=self.config.kl_coef,
             )
             return result  # (loss, advantages, metrics) or None
@@ -299,10 +378,12 @@ class BaseTrainer:
             "raw_lengths": token_lengths,
         }
 
-    def _evaluate(self, step: int) -> None:
+    def _evaluate(self, step: int) -> dict:
         """
-        Run evaluation on held-out GSM8K test split.
+        Run evaluation on the held-out test split.
         Computes accuracy, reward statistics, and response quality metrics.
+        Returns the headline metrics so callers (benchmark runner) can
+        aggregate across runs.
         """
         self.model.eval()
         eval_data = list(self.eval_dataset)
@@ -328,7 +409,7 @@ class BaseTrainer:
                     truncation=True, max_length=512,
                 ).to(self.device)
 
-                output = self.model.generate(
+                output = self._gen_model.generate(
                     prompt_inputs.input_ids,
                     attention_mask=prompt_inputs.attention_mask,
                     max_new_tokens=self.config.max_tokens,
@@ -397,6 +478,15 @@ class BaseTrainer:
 
         self.model.train()
 
+        return {
+            "step": step,
+            "accuracy": accuracy,
+            "average_reward": avg_reward,
+            "correct": correct,
+            "total": total,
+            "response_length_mean": float(lengths_arr.mean()),
+        }
+
     def _save_checkpoint(self, step: int) -> str:
         """Save model checkpoint and return the path."""
         path = os.path.join(
@@ -406,7 +496,8 @@ class BaseTrainer:
         torch.save({
             "step": step,
             "algorithm": self.algorithm,
-            "model_state_dict": self.model.state_dict(),
+            # Bare-module weights — loadable without DDP/Accelerate
+            "model_state_dict": self._gen_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.config.to_dict(),
         }, path)
@@ -422,6 +513,12 @@ class BaseTrainer:
         accumulation_count = 0
         self.optimizer.zero_grad()
 
+        # Under multi-GPU each process trains on a disjoint slice of the
+        # shuffled prompt stream (stride = world size); DDP averages the
+        # gradients, so one optimizer step consumes world_size prompts.
+        rank = self.accelerator.process_index if self.accelerator else 0
+        world = self.accelerator.num_processes if self.accelerator else 1
+
         for step in range(self.config.steps):
             step_start_time = time.time()
             # Track progress even when a step is skipped (degenerate group,
@@ -429,7 +526,7 @@ class BaseTrainer:
             self.step = step
 
             # Sample a prompt
-            item = data[step % len(data)]
+            item = data[(step * world + rank) % len(data)]
             prompt = item["prompt"]
             answer = item["answer"]
 
@@ -438,7 +535,10 @@ class BaseTrainer:
             self.model.eval()
             with torch.no_grad():
                 rollout_data = self.rollout_fn(
-                    model=self.model,
+                    # Bare module: rollout generators call generate()/custom
+                    # decode loops, which DDP wrappers don't expose. Shares
+                    # parameters with self.model, so it's the current policy.
+                    model=self._gen_model,
                     tokenizer=self.tokenizer,
                     prompt=prompt,
                     group_size=self.config.group_size,
@@ -465,7 +565,14 @@ class BaseTrainer:
             #      with no backward() to free it, the graph stays alive
             #      through the next step's forward, doubling peak VRAM
             #      (observed OOM on 6 GB with Mamba's slow path).
-            if (self.algorithm in ("dapo", "bapo", "sgrpo")
+            # Under Accelerate this early exit is disabled: skipping before
+            # the forward would leave this rank with no backward to
+            # contribute, desynchronizing DDP. The degenerate group instead
+            # falls through to _run_loss -> None, where _zero_backward keeps
+            # the collectives in lockstep. (Multi-GPU nodes have the VRAM
+            # headroom the early exit exists to save.)
+            if (self.accelerator is None
+                    and self.algorithm in ("dapo", "bapo", "sgrpo")
                     and dapo_loss.is_degenerate_group(rewards)):
                 if not self.config.no_wandb:
                     log_degenerate_group(step)
@@ -522,12 +629,19 @@ class BaseTrainer:
             )
 
             if result is None:
-                # Degenerate group — skip this step. Drop the references to
-                # the forward pass so its autograd graph is freed NOW; with
-                # no backward() coming, holding it through the next step's
-                # forward doubles peak VRAM.
+                # Degenerate group — skip this step.
+                if self.accelerator is not None:
+                    # Contribute a zero gradient so DDP stays in lockstep;
+                    # backward also frees the forward graph.
+                    self._zero_backward(new_log_probs)
+                    accumulation_count += 1
+                    self._step_if_boundary(accumulation_count)
+                # Drop the references to the forward pass so its autograd
+                # graph is freed NOW; with no backward() done (single-GPU
+                # path), holding it through the next step's forward doubles
+                # peak VRAM.
                 del new_log_probs, entropy
-                if not self.config.no_wandb:
+                if not self.config.no_wandb and self._is_main:
                     log_degenerate_group(step)
                 if step % 10 == 0:
                     print(f"Step {step}: degenerate group (all same reward), skipping.")
@@ -540,9 +654,18 @@ class BaseTrainer:
             if not torch.isfinite(loss):
                 print(f"Step {step}: non-finite loss ({loss.item()}), "
                       f"skipping update.")
-                del loss, new_log_probs, entropy  # free autograd graph
-                self.optimizer.zero_grad()
-                accumulation_count = 0
+                if self.accelerator is not None:
+                    # Zero contribution, collectives stay aligned. Do NOT
+                    # zero_grad or reset the counter here — both are shared
+                    # state that must stay identical across ranks.
+                    self._zero_backward(new_log_probs)
+                    del loss, new_log_probs, entropy
+                    accumulation_count += 1
+                    self._step_if_boundary(accumulation_count)
+                else:
+                    del loss, new_log_probs, entropy  # free autograd graph
+                    self.optimizer.zero_grad()
+                    accumulation_count = 0
                 continue
 
             # ── Accumulate tracking data for histograms ──────────────────
@@ -559,15 +682,16 @@ class BaseTrainer:
 
             # Scale loss for gradient accumulation
             scaled_loss = loss / self.config.grad_accum
-            scaled_loss.backward()
+            if self.accelerator is not None:
+                self.accelerator.backward(scaled_loss)
+            else:
+                scaled_loss.backward()
 
             accumulation_count += 1
 
             if accumulation_count % self.config.grad_accum == 0:
                 # Gradient clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=self.config.max_grad_norm
-                ).item()
+                grad_norm = self._clip_grads()
 
                 grad_was_clipped = grad_norm > self.config.max_grad_norm
 
@@ -582,8 +706,8 @@ class BaseTrainer:
                 )
                 throughput = total_tokens / max(step_time, 1e-6)
 
-                # ── WandB logging ────────────────────────────────────────
-                if not self.config.no_wandb:
+                # ── WandB logging (main process only) ────────────────────
+                if not self.config.no_wandb and self._is_main:
                     log_step(
                         step=step,
                         algorithm=self.algorithm,
@@ -640,7 +764,7 @@ class BaseTrainer:
                             self._all_response_lengths.clear()
 
                 # ── Console output ───────────────────────────────────────
-                if step % 10 == 0:
+                if step % 10 == 0 and self._is_main:
                     print(
                         f"Step {step:4d} | Loss: {loss.item():.4f} "
                         f"| Reward: {rewards.mean().item():.3f} "
@@ -650,20 +774,32 @@ class BaseTrainer:
                         f"| {step_time:.1f}s"
                     )
 
-            # ── Periodic evaluation ──────────────────────────────────────
-            if (step > 0 and step % self.config.eval_every == 0):
+            # ── Periodic evaluation (main process only) ──────────────────
+            if (step > 0 and step % self.config.eval_every == 0
+                    and self._is_main):
                 self._evaluate(step)
 
-            # ── Periodic checkpoint ──────────────────────────────────────
-            if (step > 0 and step % self.config.checkpoint_every == 0):
+            # ── Periodic checkpoint (main process only) ──────────────────
+            if (step > 0 and step % self.config.checkpoint_every == 0
+                    and self._is_main):
                 ckpt_path = self._save_checkpoint(step)
                 if not self.config.no_wandb:
                     log_checkpoint(step, self.algorithm, ckpt_path)
 
-        # ── Final eval and checkpoint ────────────────────────────────────
-        print(f"\nTraining complete. Final step: {self.step}")
-        self._evaluate(self.step)
-        ckpt_path = self._save_checkpoint(self.step)
-        if not self.config.no_wandb:
-            log_checkpoint(self.step, self.algorithm, ckpt_path)
-            finish()
+        # ── Final eval and checkpoint (main process only) ─────────────────
+        final_eval = None
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+        if self._is_main:
+            print(f"\nTraining complete. Final step: {self.step}")
+            final_eval = self._evaluate(self.step)
+            ckpt_path = self._save_checkpoint(self.step)
+            if not self.config.no_wandb:
+                log_checkpoint(self.step, self.algorithm, ckpt_path)
+                finish()
+
+        return {
+            "algorithm": self.algorithm,
+            "steps_attempted": self.step + 1 if self.config.steps else 0,
+            "final_eval": final_eval,   # None on non-main ranks
+        }

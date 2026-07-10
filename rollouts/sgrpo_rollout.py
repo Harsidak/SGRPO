@@ -45,31 +45,51 @@ from transformers import MambaForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 
-def _snapshot_ssm_states(cache: DynamicCache) -> list[dict[str, torch.Tensor]]:
+def _snapshot_ssm_states(cache: DynamicCache) -> list[dict]:
     """
-    Extract and clone all SSM recurrent states AND conv states from a
-    DynamicCache.
+    Extract and clone the SSM recurrent states AND conv states of every
+    layer that carries them.
 
     Per layer for Mamba-130m (24 layers):
         recurrent_states: [1, 1536, 16] — h_t, the tensor that carries
                           contamination between rollouts
         conv_states:      [1, 1536, 4]  — causal conv buffer
 
+    Hybrid SSM+attention models (Jamba, Zamba, Bamba, Nemotron-H) mix SSM
+    layers with attention layers in the same cache; attention layers have
+    no recurrent state and are skipped here (their KV entries are handled
+    separately in _restore_ssm_states). Each snapshot entry records its
+    layer index so restore targets the right layers.
+
     NOT the residual stream hidden states (those are output_hidden_states,
     which misleadingly show cosine similarity ~1.0 — see CLAUDE.md §2.4).
     """
-    return [
-        {
-            "recurrent": layer.recurrent_states.detach().clone(),
-            "conv": layer.conv_states.detach().clone(),
-        }
-        for layer in cache.layers
-    ]
+    snapshots = []
+    for layer_idx, layer in enumerate(cache.layers):
+        recurrent = getattr(layer, "recurrent_states", None)
+        if recurrent is None:
+            continue  # attention layer in a hybrid model
+        conv = getattr(layer, "conv_states", None)
+        snapshots.append({
+            "layer_idx": layer_idx,
+            "recurrent": recurrent.detach().clone(),
+            "conv": conv.detach().clone() if conv is not None else None,
+        })
+
+    if not snapshots:
+        raise RuntimeError(
+            "No SSM recurrent states found in the cache — this model has no "
+            "state to isolate (pure transformer?). Use "
+            "base_rollout.generate_rollouts instead; the trainer's "
+            "architecture detection should already route it there."
+        )
+    return snapshots
 
 
 def _restore_ssm_states(
     cache: DynamicCache,
-    snapshot: list[dict[str, torch.Tensor]],
+    snapshot: list[dict],
+    prompt_len: int | None = None,
 ) -> None:
     """
     Restore SSM states from a snapshot into a DynamicCache in-place.
@@ -78,10 +98,30 @@ def _restore_ssm_states(
     Cost: L * d_inner * (d_state + conv_kernel) floats copied
     For Mamba-130m: 24 * 1536 * (16 + 4) = 737,280 floats ≈ 1.4MB in fp32.
     Negligible overhead; no forward passes involved.
+
+    Hybrid models: SSM layers are restored by tensor copy; the remaining
+    attention layers still hold KV entries appended by the previous rollout,
+    so the cache is cropped back to the prompt length. (Attention layers are
+    stateless in the sense that cropped KV is bit-identical to re-encoding —
+    no approximation involved.)
     """
-    for layer_idx, state in enumerate(snapshot):
-        cache.layers[layer_idx].recurrent_states.copy_(state["recurrent"])
-        cache.layers[layer_idx].conv_states.copy_(state["conv"])
+    for state in snapshot:
+        layer = cache.layers[state["layer_idx"]]
+        layer.recurrent_states.copy_(state["recurrent"])
+        if state["conv"] is not None:
+            layer.conv_states.copy_(state["conv"])
+
+    # Hybrid cache: some layers are attention layers with per-token KV.
+    if prompt_len is not None and len(snapshot) < len(cache.layers):
+        if hasattr(cache, "crop"):
+            cache.crop(prompt_len)
+        else:
+            raise RuntimeError(
+                "Hybrid model cache has attention layers holding previous-"
+                "rollout KV entries, but this transformers version's "
+                "DynamicCache has no crop() — cannot guarantee isolation. "
+                "Upgrade transformers or use base_rollout for this model."
+            )
 
 
 def _compute_isolation_diagnostics(
@@ -99,8 +139,8 @@ def _compute_isolation_diagnostics(
     cos_sims = []
     l2_drifts = []
 
-    for layer_idx, h0 in enumerate(h0_clean):
-        h_post = cache_post_rollout.layers[layer_idx].recurrent_states
+    for h0 in h0_clean:
+        h_post = cache_post_rollout.layers[h0["layer_idx"]].recurrent_states
         h0_flat = h0["recurrent"].flatten().float()
         h_post_flat = h_post.flatten().float()
 
@@ -183,8 +223,9 @@ def generate_rollouts_isolated(
         for k in range(group_size):
             # Restore h_0 before every rollout — this is the isolation
             # mechanism. Pure tensor copy into the same cache object;
-            # no prompt re-encoding needed.
-            _restore_ssm_states(cache, h0_clean)
+            # no prompt re-encoding needed. prompt_len lets hybrid caches
+            # crop stale attention KV from the previous rollout.
+            _restore_ssm_states(cache, h0_clean, prompt_len=prompt_len)
 
             generated_ids = prompt_inputs.input_ids.clone()
             log_probs = []

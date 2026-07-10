@@ -41,6 +41,50 @@ from losses.dapo_loss import is_degenerate_group
 from losses.grpo_loss import compute_group_advantages
 
 
+def _reverse_discounted_cumsum(
+    delta: torch.Tensor,    # [G, gen_len]
+    gamma: float,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """
+    out[t] = Σ_{k=t}^{T-1} γ^{k-t} · delta[k]  — a right-to-left discounted
+    scan, computed without a per-token Python loop.
+
+    Within a chunk of length L the scan collapses to one cumsum:
+        out[t] = (Σ_{k=t}^{e-1} γ^k · delta[k]) / γ^t  +  γ^{e-t} · carry
+    Only the carry between chunks is sequential, so the Python loop runs
+    gen_len / chunk_size times (4 iterations for a 2048-token generation)
+    instead of gen_len times.
+
+    Chunking is also what makes the γ-power trick numerically safe: the
+    powers γ^j inside one chunk span at most chunk_size exponents
+    (2^(512/30) ≈ 2^17 at decay=30), far from fp32 overflow — whereas a
+    single global cumsum over thousands of tokens would need γ^{-t} up to
+    2^(t/30) and overflow.
+    """
+    G, T = delta.shape
+    orig_dtype = delta.dtype
+    delta = delta.float()
+
+    out = torch.empty_like(delta)
+    carry = torch.zeros(G, 1, dtype=delta.dtype, device=delta.device)
+
+    first_start = ((T - 1) // chunk_size) * chunk_size
+    for start in range(first_start, -1, -chunk_size):
+        end = min(start + chunk_size, T)
+        L = end - start
+        j = torch.arange(L, device=delta.device, dtype=delta.dtype)
+        gpow = gamma ** j                                       # [L]
+        weighted = delta[:, start:end] * gpow                   # [G, L]
+        # c[j] = Σ_{m=j}^{L-1} γ^m · delta[start+m]
+        c = torch.flip(torch.cumsum(torch.flip(weighted, dims=[1]), dim=1),
+                       dims=[1])
+        out[:, start:end] = c / gpow + carry * gamma ** (L - j)
+        carry = out[:, start:start + 1]
+
+    return out.to(orig_dtype)
+
+
 def compute_future_kl(
     new_log_probs: torch.Tensor,    # [G, gen_len]
     old_log_probs: torch.Tensor,    # [G, gen_len]
@@ -48,7 +92,7 @@ def compute_future_kl(
     decay_rate: float = 30.0,
 ) -> torch.Tensor:
     """
-    Compute Future-KL influence weights per token (VECTORIZED).
+    Compute Future-KL influence weights per token (vectorized).
 
     From FIPO (Ma et al. 2026):
     FutureKL_t = Σ_{k=t}^{T} γ^{k-t} · M_k · δlog_p_k
@@ -58,12 +102,13 @@ def compute_future_kl(
     - γ = 2^{-1/decay_rate}
     - M_k = attention_mask (1 for real tokens, 0 for padding)
 
-    Implementation: vectorized reverse exponential moving average using
-    torch.flip + cumulative weighted sum. Eliminates the Python for-loop
-    over gen_len positions.
+    Padding is zeroed BEFORE the scan (the "tensor trap"): a padded token
+    must contribute nothing to any earlier token's sum, and masking after
+    the scan would not undo its contribution to the running discount.
 
-    Complexity: O(G · gen_len) with full GPU parallelism.
-    Previous implementation: O(gen_len) sequential Python loop.
+    Implementation: chunked reverse discounted cumsum — see
+    _reverse_discounted_cumsum. O(gen_len / chunk_size) sequential steps,
+    everything else parallel on GPU.
 
     Args:
         new_log_probs:  [G, gen_len] — current policy
@@ -82,24 +127,7 @@ def compute_future_kl(
     delta_log_p = (new_log_probs - old_log_probs).clamp(-20.0, 20.0)
     delta_log_p = delta_log_p * attention_mask
 
-    G, gen_len = delta_log_p.shape
-
-    # Vectorized reverse exponential moving average
-    # Flip time axis, apply causal EMA, flip back
-    delta_flipped = torch.flip(delta_log_p, dims=[1])  # [G, gen_len]
-
-    # Build exponential weights for cumulative sum
-    # future_kl[t] = δ[t] + γ·δ[t+1] + γ²·δ[t+2] + ...
-    # After flip: future_kl_flipped[k] = δ_flipped[k] + γ·future_kl_flipped[k-1]
-    # This is a causal EMA which we compute via a scan
-    future_kl_flipped = torch.zeros_like(delta_flipped)
-    future_kl_flipped[:, 0] = delta_flipped[:, 0]
-    for k in range(1, gen_len):
-        future_kl_flipped[:, k] = delta_flipped[:, k] + gamma * future_kl_flipped[:, k - 1]
-
-    future_kl = torch.flip(future_kl_flipped, dims=[1])
-
-    return future_kl
+    return _reverse_discounted_cumsum(delta_log_p, gamma)
 
 
 def compute_influence_weights(

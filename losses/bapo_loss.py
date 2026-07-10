@@ -1,19 +1,49 @@
 """
 losses/bapo_loss.py
 
-BAPO: Balanced Advantage Policy Optimization loss.
+BAPO: Balanced Policy Optimization with Adaptive Clipping.
 
-One change from DAPO:
-Adaptive clipping bounds based on the ratio of positive to negative
-advantage tokens in the current batch.
+One change from DAPO: the clipping bounds (c_low, c_high) are not fixed —
+they are adjusted per batch so that positive-advantage tokens contribute
+at least a target fraction rho_0 of the policy-gradient signal.
 
 Why: fixed clipping treats positive and negative advantage updates
-symmetrically. But negative advantage tokens (suppressing bad behavior)
-tend to dominate early in training, producing unstable gradients.
-Adaptive bounds rebalance this.
+symmetrically. But negative-advantage tokens (suppressing bad behavior)
+tend to dominate early in training, producing unstable, entropy-collapsing
+gradients. BAPO rebalances this by widening c_high (letting more
+positive-advantage tokens through) and, when that is exhausted, raising
+c_low (clipping away more negative-advantage tokens).
 
-eps_high = eps * (N_neg / (N_pos + N_neg))
-eps_low  = eps * (N_pos / (N_pos + N_neg))
+Algorithm (verbatim from the BAPO paper):
+
+    Input: movable range of clipping bounds [a-, b-] and [a+, b+],
+           step size of upper bound d1, step size of lower bound d2,
+           positive token contribution threshold rho_0
+
+    Procedure Dynamically adjusting the clipping bounds c_high and c_low
+        Initialize clipping bounds c_low = a- and c_high = a+
+        while the positive token contribution rho < rho_0
+              and c_low + d2 <= b- do
+            if c_high + d1 <= b+ then
+                c_high <- c_high + d1
+            else
+                c_low <- c_low + d2
+        end
+
+    Update the policy by maximizing:
+        J_BAPO = E_y Sum_t min(r_t * A_t, clip(r_t, c_low, c_high) * A_t)
+
+The positive token contribution rho is the share of the gradient-carrying
+surrogate magnitude coming from positive-advantage tokens:
+
+    rho = S+ / (S+ + S-)
+    S+  = Sum over {A_t > 0, r_t < c_high} of  r_t * A_t        (unclipped)
+    S-  = Sum over {A_t < 0, r_t > c_low}  of  r_t * |A_t|      (unclipped)
+
+Tokens outside their bound are clipped: their surrogate is a constant and
+carries no gradient, so they are excluded from rho. Widening c_high
+un-clips more positive tokens (raises S+); raising c_low clips away more
+negative tokens (lowers S-). Both moves push rho toward rho_0.
 
 Note: BAPO is a standalone baseline in this project.
 Its adaptive clipping is NOT composed with SGRPO's Future-KL weighting
@@ -29,66 +59,84 @@ Returns:
     (or None if degenerate group)
 """
 
-"""
-Algorithm Working as per Research Paper: BAPO
-Input: Initialized LLM policy 𝜋𝜃, training dataset D, reward function 𝑅, staleness 𝐸,
-    movable range of clipping bounds [𝑎−, 𝑏−] and [𝑎+, 𝑏+], step size of upper bound 𝛿1,
-    step size of lower bound 𝛿2, positive token contribution threshold 𝜌0
-1 for step 𝑠 = 1...𝑆 do
-2   Procedure Sample and filter out responses
-3       Update the old LLM policy 𝜋𝜃rollout ← 𝜋𝜃 ;
-4       Sample the 𝑠-th batch D𝑠 from D ;
-5       Sample 𝐺 responses {𝒚𝑖}𝐺𝑖=1 ∼ 𝜋𝜃rollout (·|𝒙), where 𝒙 ∈ D𝑠 ;
-6       Compute reward and advantage for each 𝒚𝑖 based on reward function 𝑅 ;
-7   for staleness = 0...𝐸 do
-8   Procedure Dynamically adjusting the clipping bounds 𝑐high and 𝑐low
-9       Initialize clipping bounds 𝑐low = 𝑎− and 𝑐high = 𝑎+ ;
-10      while the positive token contribution 𝜌 < 𝜌0 and 𝑐low + 𝛿2 ≤ 𝑏−
-11      do
-12          if 𝑐high + 𝛿1 ≤ 𝑏+ then
-13              𝑐high ← 𝑐high + 𝛿1
-14          else
-15              𝑐low ← 𝑐low + 𝛿2
-16          end
-17      end
-18      Procedure Update the LLM policy 𝜋𝜃
-19          Update the LLM policy 𝜋𝜃 by maximizing the following objective:
-20              𝐽BAPO(𝜃) = 𝔼𝒚∼𝜋𝜃rollout ( · |𝒙) Summation from t=1 to T ( min(𝑟𝑡 · 𝐴𝑡 , clip(𝑟𝑡 , 𝑐low, 𝑐high) · 𝐴𝑡) ) 
-21     end
-22  end
-"""
-
 import torch
 from losses.dapo_loss import is_degenerate_group
 from losses.grpo_loss import compute_group_advantages, compute_kl_penalty_k3
 
+# Safety cap on the bound-adjustment loop. With default ranges and step
+# sizes the loop runs at most (b+ - a+)/d1 + (b- - a-)/d2 ~ 22 iterations;
+# this cap only guards against misconfigured deltas (e.g. 0).
+_MAX_BOUND_ITERS = 1000
+
+
+def _positive_contribution(
+    ratio: torch.Tensor,                 # [G, gen_len]
+    advantages_expanded: torch.Tensor,   # [G, gen_len]
+    attention_mask: torch.Tensor,        # [G, gen_len]
+    c_low: float,
+    c_high: float,
+) -> float:
+    """
+    rho(c_low, c_high): share of gradient-carrying surrogate magnitude from
+    positive-advantage tokens, given candidate clipping bounds.
+
+    A token carries gradient only while its ratio is inside its clipping
+    bound: positive-advantage tokens are clipped (gradient-dead) at
+    r >= c_high, negative-advantage tokens at r <= c_low.
+    """
+    pos = (advantages_expanded > 0) & (ratio < c_high)
+    neg = (advantages_expanded < 0) & (ratio > c_low)
+
+    contrib = (ratio * advantages_expanded.abs()) * attention_mask
+    s_pos = contrib[pos].sum().item() if pos.any() else 0.0
+    s_neg = contrib[neg].sum().item() if neg.any() else 0.0
+
+    return s_pos / (s_pos + s_neg + 1e-8)
+
 
 def compute_adaptive_bounds(
-    advantages_expanded: torch.Tensor,  # [G, gen_len]
-    base_epsilon: float,
-) -> tuple[float, float]:
+    ratio: torch.Tensor,                 # [G, gen_len]
+    advantages_expanded: torch.Tensor,   # [G, gen_len]
+    attention_mask: torch.Tensor,        # [G, gen_len]
+    c_low_min: float = 0.8,      # a-  (paper: start of lower-bound range)
+    c_low_max: float = 0.9,      # b-  (paper: end of lower-bound range)
+    c_high_min: float = 1.2,     # a+  (paper: start of upper-bound range)
+    c_high_max: float = 1.32,    # b+  (paper: end of upper-bound range)
+    delta_high: float = 0.01,    # d1  (paper: step size of upper bound)
+    delta_low: float = 0.01,     # d2  (paper: step size of lower bound)
+    rho_target: float = 0.5,     # rho_0 (paper: contribution threshold)
+) -> tuple[float, float, float, int]:
     """
-    Compute adaptive clipping bounds based on positive/negative advantage split.
+    The BAPO paper's "Dynamically adjusting the clipping bounds" procedure.
 
-    Args:
-        advantages_expanded: [G, gen_len] advantage values per token
-        base_epsilon:        base clipping bound (e.g. 0.2)
+    Starts from the tightest bounds (a-, a+) and, while the positive token
+    contribution rho is below rho_0, first widens c_high in steps of d1 up
+    to b+, then raises c_low in steps of d2 up to b-. rho is recomputed
+    after every adjustment because moving a bound changes which tokens are
+    clipped.
 
     Returns:
-        (eps_low, eps_high) — asymmetric bounds
+        (c_low, c_high, rho, n_iterations)
     """
-    n_pos = (advantages_expanded > 0).float().sum().item()
-    n_neg = (advantages_expanded < 0).float().sum().item()
-    total = n_pos + n_neg + 1e-8
+    c_low, c_high = c_low_min, c_high_min
+    rho = _positive_contribution(
+        ratio, advantages_expanded, attention_mask, c_low, c_high
+    )
 
-    eps_high = base_epsilon * (n_neg / total)
-    eps_low = base_epsilon * (n_pos / total)
+    iters = 0
+    while (rho < rho_target
+           and c_low + delta_low <= c_low_max
+           and iters < _MAX_BOUND_ITERS):
+        if c_high + delta_high <= c_high_max:
+            c_high += delta_high
+        else:
+            c_low += delta_low
+        rho = _positive_contribution(
+            ratio, advantages_expanded, attention_mask, c_low, c_high
+        )
+        iters += 1
 
-    # Clamp to prevent degenerate bounds
-    eps_high = max(eps_high, 0.01)
-    eps_low = max(eps_low, 0.01)
-
-    return eps_low, eps_high
+    return c_low, c_high, rho, iters
 
 
 def compute(
@@ -96,13 +144,28 @@ def compute(
     old_log_probs: torch.Tensor,    # [G, gen_len]
     rewards: torch.Tensor,          # [G]
     attention_mask: torch.Tensor,   # [G, gen_len]
-    base_epsilon: float = 0.2,
+    c_low_min: float = 0.8,         # a-
+    c_low_max: float = 0.9,         # b-
+    c_high_min: float = 1.2,        # a+
+    c_high_max: float = 1.32,       # b+
+    delta_high: float = 0.01,       # d1
+    delta_low: float = 0.01,        # d2
+    rho_target: float = 0.5,        # rho_0
     ref_log_probs: torch.Tensor | None = None,  # [G, gen_len] — frozen reference
     kl_coef: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor, dict] | None:
     """
-    BAPO loss with adaptive clipping bounds and reference-model KL penalty
-    (inherited from GRPO's foundation — the original BAPO paper keeps it).
+    BAPO loss: DAPO's token-normalized clipped surrogate with the paper's
+    dynamically adjusted clipping bounds, plus the reference-model KL
+    penalty (inherited from GRPO's foundation — the original BAPO paper
+    keeps it).
+
+    Note the bounds are ABSOLUTE ratio bounds clip(r, c_low, c_high),
+    not the symmetric 1 +/- eps form — this is how the paper states the
+    objective. Defaults (c_low in [0.8, 0.9], c_high in [1.2, 1.32])
+    reduce to standard eps=0.2 clipping when no adjustment fires, with
+    the upper range extending past DAPO's clip-higher value of 1.28.
+
     Returns None if group is degenerate.
     Returns (loss, advantages, metrics_dict) otherwise.
     """
@@ -113,11 +176,18 @@ def compute(
     ratio = torch.exp(new_log_probs - old_log_probs)
     advantages_expanded = advantages.unsqueeze(1).expand_as(ratio)
 
-    eps_low, eps_high = compute_adaptive_bounds(advantages_expanded, base_epsilon)
+    # Bound search is a batch statistic, not part of the computation graph
+    with torch.no_grad():
+        c_low, c_high, rho, bound_iters = compute_adaptive_bounds(
+            ratio, advantages_expanded, attention_mask,
+            c_low_min=c_low_min, c_low_max=c_low_max,
+            c_high_min=c_high_min, c_high_max=c_high_max,
+            delta_high=delta_high, delta_low=delta_low,
+            rho_target=rho_target,
+        )
 
     unclipped = ratio * advantages_expanded
-    clipped_ratio = torch.clamp(ratio, 1 - eps_low, 1 + eps_high)
-    clipped = clipped_ratio * advantages_expanded
+    clipped = torch.clamp(ratio, c_low, c_high) * advantages_expanded
 
     per_token_loss = -torch.min(unclipped, clipped)
 
@@ -135,13 +205,8 @@ def compute(
 
     # ── Metrics for WandB ────────────────────────────────────────────────
     with torch.no_grad():
-        n_pos = (advantages_expanded > 0).float().sum().item()
-        n_neg = (advantages_expanded < 0).float().sum().item()
-        total = n_pos + n_neg + 1e-8
-        rho = n_pos / total  # positive contribution ratio
-
         clip_fraction = (
-            (ratio < 1 - eps_low) | (ratio > 1 + eps_high)
+            (ratio < c_low) | (ratio > c_high)
         ).float().mean().item()
 
         metrics = {
@@ -151,11 +216,12 @@ def compute(
             "train/ratio_max": ratio.max().item(),
             "train/ratio_min": ratio.min().item(),
             "train/approx_kl": (0.5 * (new_log_probs - old_log_probs).pow(2)).mean().item(),
-            "bapo/c_low": eps_low,
-            "bapo/c_high": eps_high,
+            "bapo/c_low": c_low,
+            "bapo/c_high": c_high,
+            "bapo/bound_adjust_iterations": bound_iters,
             "bapo/positive_contribution_ratio": rho,
-            "bapo/positive_contribution_target": 0.5,
-            "bapo/contribution_gap": abs(rho - 0.5),
+            "bapo/positive_contribution_target": rho_target,
+            "bapo/contribution_gap": abs(rho - rho_target),
             "bapo/policy_loss": policy_loss.item(),
             "bapo/kl_penalty": kl_penalty.item(),
             "bapo/kl_coef": kl_coef,

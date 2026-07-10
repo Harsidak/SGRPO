@@ -80,8 +80,14 @@ class TrainingConfig:
     # ── DAPO-specific ────────────────────────────────────────────────────────
     dapo_epsilon_high: float = 0.28
 
-    # ── BAPO-specific ────────────────────────────────────────────────────────
-    bapo_rho_target: float = 0.5
+    # ── BAPO-specific (paper notation in comments) ───────────────────────────
+    bapo_rho_target: float = 0.5    # rho_0 — positive token contribution threshold
+    bapo_c_low_min: float = 0.8     # a- — initial (tightest) lower clipping bound
+    bapo_c_low_max: float = 0.9     # b- — maximum the lower bound may be raised to
+    bapo_c_high_min: float = 1.2    # a+ — initial (tightest) upper clipping bound
+    bapo_c_high_max: float = 1.32   # b+ — maximum the upper bound may be widened to
+    bapo_delta_high: float = 0.01   # d1 — step size of the upper bound
+    bapo_delta_low: float = 0.01    # d2 — step size of the lower bound
 
     # ── Evaluation ───────────────────────────────────────────────────────────
     eval_every: int = 50      # evaluate every N steps
@@ -96,6 +102,10 @@ class TrainingConfig:
 
     # ── System ───────────────────────────────────────────────────────────────
     device: str = "cpu"
+    # Multi-GPU / cloud training via HuggingFace Accelerate. Launch with
+    # `accelerate launch main.py --use_accelerate ...`. When False (default)
+    # the trainer is plain single-device PyTorch — local behavior unchanged.
+    use_accelerate: bool = False
 
     # ── WandB ────────────────────────────────────────────────────────────────
     wandb_project: str = "rl-algo-comparison-2026"

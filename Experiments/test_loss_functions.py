@@ -125,6 +125,38 @@ def main():
           bapo_loss.compute(deg[0], deg[1], deg[3], deg[4]) is None)
     check("padded positions do not affect loss",
           masked_invariance(bapo_loss.compute, ref_log_probs=None))
+    # Paper algorithm: bounds must stay inside the movable ranges
+    # [a-, b-] = [0.8, 0.9] and [a+, b+] = [1.2, 1.32] (defaults).
+    check("c_low within movable range [a-, b-]",
+          0.8 - 1e-9 <= metrics["bapo/c_low"] <= 0.9 + 1e-9,
+          f"c_low={metrics['bapo/c_low']:.3f}")
+    check("c_high within movable range [a+, b+]",
+          1.2 - 1e-9 <= metrics["bapo/c_high"] <= 1.32 + 1e-9,
+          f"c_high={metrics['bapo/c_high']:.3f}")
+    check("rho reported in metrics",
+          0.0 <= metrics["bapo/positive_contribution_ratio"] <= 1.0)
+    # Bound-adjustment direction: when negative-advantage tokens dominate
+    # (rho < rho_0), the procedure must widen c_high before touching c_low.
+    ratio_uni = torch.ones(G, T)
+    adv_neg_heavy = torch.full((G, T), -1.0)
+    adv_neg_heavy[0, :2] = 1.0                     # tiny positive share
+    c_low, c_high, rho, iters = bapo_loss.compute_adaptive_bounds(
+        ratio_uni, adv_neg_heavy, torch.ones(G, T))
+    check("imbalanced batch widens c_high to b+",
+          abs(c_high - 1.32) < 1e-9, f"c_high={c_high:.3f} after {iters} iters")
+    check("then raises c_low toward b-", c_low > 0.8,
+          f"c_low={c_low:.3f}")
+    # Positive-heavy batch: rho >= rho_0 immediately, bounds stay at
+    # (a-, a+) and the adjustment loop never fires. (An exactly 50/50
+    # batch would still fire: rho = 0.5 - eps < rho_0 per the paper's
+    # strict `while rho < rho_0`.)
+    adv_pos_heavy = torch.ones(G, T)
+    adv_pos_heavy[G - 1:] = -1.0
+    c_low, c_high, rho, iters = bapo_loss.compute_adaptive_bounds(
+        ratio_uni, adv_pos_heavy, torch.ones(G, T))
+    check("satisfied batch keeps tightest bounds",
+          abs(c_low - 0.8) < 1e-9 and abs(c_high - 1.2) < 1e-9 and iters == 0,
+          f"(c_low, c_high)=({c_low:.2f}, {c_high:.2f}), rho={rho:.3f}")
 
     # ── SGRPO ────────────────────────────────────────────────────────────
     print("\nSGRPO:")
@@ -146,6 +178,22 @@ def main():
     check("influence weights within [1.0, 1.2]",
           bool((w >= 1.0 - 1e-6).all() and (w <= 1.2 + 1e-6).all()),
           f"range=[{w.min().item():.4f}, {w.max().item():.4f}]")
+    # Chunked scan must match the naive O(T) reference loop exactly,
+    # including across chunk boundaries (gen_len > chunk_size) and for
+    # gen_len not divisible by chunk_size.
+    g = torch.Generator().manual_seed(7)
+    for gen_len, chunk in [(12, 512), (1030, 512), (517, 128)]:
+        delta = torch.randn(3, gen_len, generator=g)
+        gamma = 2.0 ** (-1.0 / 30.0)
+        fast = sgrpo_loss._reverse_discounted_cumsum(delta, gamma, chunk)
+        ref = torch.zeros_like(delta)
+        running = torch.zeros(3)
+        for t in range(gen_len - 1, -1, -1):
+            running = delta[:, t] + gamma * running
+            ref[:, t] = running
+        err = (fast - ref).abs().max().item()
+        check(f"scan matches reference (T={gen_len}, chunk={chunk})",
+              err < 1e-4, f"max_abs_err={err:.2e}")
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'='*50}")

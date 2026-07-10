@@ -25,14 +25,8 @@ import torch
 # Config module handles .env loading at import time
 from config import TrainingConfig, set_deterministic_seeds, config_from_args
 from models.load_model import load_model, detect_architecture
-from data.gsm8k import GSM8KDataset
+from data import DATASETS
 from trainer.base_trainer import BaseTrainer
-
-# Benchmark registry — every entry implements BaseRewardDataset, so the
-# trainer needs no changes when a new benchmark is added here.
-DATASETS = {
-    "gsm8k": GSM8KDataset,
-}
 
 
 def get_args():
@@ -83,6 +77,12 @@ def get_args():
     parser.add_argument("--seed",       type=int,   default=42)
     parser.add_argument("--device",     type=str,   default="cuda")
 
+    # ── Multi-GPU / cloud ────────────────────────────────────────────────
+    parser.add_argument("--use_accelerate", action="store_true",
+                        help="Enable HuggingFace Accelerate (multi-GPU, "
+                             "mixed precision). Run via: "
+                             "accelerate launch main.py --use_accelerate ...")
+
     # ── Evaluation ───────────────────────────────────────────────────────
     parser.add_argument("--eval_every",  type=int, default=50)
     parser.add_argument("--eval_samples", type=int, default=50)
@@ -116,8 +116,11 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Load model and data ──────────────────────────────────────────────
+    # Under Accelerate, load on CPU and let accelerator.prepare() place the
+    # model — loading straight to "cuda" would put every rank on cuda:0.
     model, tokenizer = load_model(
-        device=config.device, dtype=config.dtype,
+        device="cpu" if config.use_accelerate else config.device,
+        dtype=config.dtype,
         model_name=config.model_name,
     )
     arch = detect_architecture(model)

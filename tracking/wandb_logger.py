@@ -39,7 +39,7 @@ def init_run(
     algorithm: str,
     run_name: str,
     config: dict,
-    project: str = "rl-algo-comparison-2026",
+    project: str = "SGRPO",
 ) -> None:
     """
     Initialize a W&B run with the full config from wandb_tracking_spec.md.

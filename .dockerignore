@@ -1,0 +1,14 @@
+# Keep the Docker build context minimal — only code + lockfiles matter.
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.env
+wandb/
+checkpoints/
+Experiments/results/
+Docs/results/
+data/hf/
+*.ipynb_checkpoints
+.claude/
