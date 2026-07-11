@@ -43,6 +43,11 @@ python main.py --algorithm sgrpo --batch_size 1 --grad_accum 8
 python main.py --algorithm sgrpo --steps 50 --no_wandb --device cpu
 ```
 
+## Testing the Training 
+```bash
+python -m Experiments.evaluate_checkpoint --results Experiments/results/benchmark_results.json --eval_samples 200```
+
+
 ## Experiment Suite
 
 The `Experiments/` directory contains executable scripts to reproduce the core claims of the research:
