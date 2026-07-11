@@ -1,5 +1,5 @@
 [project]
-name = "custom-rl"
+name = "sgrpo"
 version = "0.1.0"
 description = "SGRPO: State-Isolated Group Relative Policy Optimization. Fixes memory drift in Mamba (SSMs) by resetting hidden states across RL rollouts, unlocking advanced reasoning for edge and offline AI."
 readme = "README.md"

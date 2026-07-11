@@ -1,4 +1,4 @@
-# Custom-RL: SGRPO Research Project
+# SGRPO: State-Isolated Group Relative Policy Optimization
 
 This repository contains the research implementation for **SGRPO (State-aware Group Relative Policy Optimization)**, along with a baseline comparison against four other RL-for-LLM algorithms (PPO, GRPO, DAPO, and BAPO).
 
