@@ -31,9 +31,9 @@ from torch.optim import AdamW
 
 from rewards.gsm8k_reward import compute_group_rewards
 from tracking.wandb_logger import (
-    init_run, init_local_sink, log_step, log_eval, log_histograms,
-    log_sample_table, log_checkpoint, log_degenerate_group,
-    log_run_metadata, finish,
+    init_run, init_local_sink, log_rollout, log_step, log_eval,
+    log_histograms, log_sample_table, log_checkpoint,
+    log_degenerate_group, log_run_metadata, finish,
 )
 
 # Import loss modules (not wildcard — each exports compute())
@@ -530,19 +530,28 @@ class BaseTrainer:
         }
 
     def _save_checkpoint(self, step: int) -> str:
-        """Save model checkpoint and return the path."""
+        """Save model checkpoint and return the path.
+
+        The filename includes run_name so benchmark runs of the same
+        algorithm with different seeds don't overwrite each other.
+        Optimizer state is optional (config.save_optimizer_state) — the
+        benchmark disables it because its checkpoints exist for test-set
+        evaluation, not resuming, and AdamW state triples the file size.
+        """
         path = os.path.join(
             self.config.checkpoint_dir,
-            f"{self.algorithm}_step{step}.pt"
+            f"{self.algorithm}_{self.config.run_name}_step{step}.pt"
         )
-        torch.save({
+        checkpoint = {
             "step": step,
             "algorithm": self.algorithm,
             # Bare-module weights — loadable without DDP/Accelerate
             "model_state_dict": self._gen_model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.config.to_dict(),
-        }, path)
+        }
+        if getattr(self.config, "save_optimizer_state", True):
+            checkpoint["optimizer_state_dict"] = self.optimizer.state_dict()
+        torch.save(checkpoint, path)
         print(f"  Checkpoint saved: {path}")
         return path
 
@@ -598,6 +607,48 @@ class BaseTrainer:
                 rewards_list, dtype=torch.float32, device=self.device
             )
 
+            # ── Response statistics ──────────────────────────────────────
+            # Computed BEFORE the degenerate check (cheap token counting) so
+            # rollout-phase metrics are logged for every step, including the
+            # skipped ones.
+            generated_ids = rollout_data["generated_ids"].to(self.device)
+            prompt_len = rollout_data["prompt_len"]
+            gen_len = generated_ids.shape[1] - prompt_len
+
+            response_stats = self._compute_response_stats(
+                rollout_data["generated_texts"], generated_ids, prompt_len
+            )
+
+            is_degenerate = (
+                self.algorithm in ("dapo", "bapo", "sgrpo")
+                and dapo_loss.is_degenerate_group(rewards)
+            )
+
+            # ── Rollout-phase RL metrics — logged EVERY step ─────────────
+            # log_step only fires on optimizer updates; early in training
+            # nearly every group is degenerate, so without this the W&B run
+            # shows little beyond GPU/system charts. rollout/* keeps reward
+            # signal, response lengths, and the degenerate flag visible
+            # from step 0.
+            if self._is_main:
+                log_rollout(
+                    step=step,
+                    algorithm=self.algorithm,
+                    reward_mean=rewards.mean().item(),
+                    reward_std=rewards.std().item() if rewards.numel() > 1 else 0.0,
+                    reward_max=rewards.max().item(),
+                    reward_min=rewards.min().item(),
+                    reward_positive_fraction=(rewards > 0).float().mean().item(),
+                    response_length_mean=response_stats["response_length_mean"],
+                    response_length_std=response_stats["response_length_std"],
+                    response_length_max=response_stats["response_length_max"],
+                    response_length_min=response_stats["response_length_min"],
+                    unique_tokens_ratio=response_stats["unique_tokens_ratio"],
+                    generation_time=generation_time,
+                    group_size=self.config.group_size,
+                    is_degenerate=is_degenerate,
+                )
+
             # ── Early degenerate-group check ─────────────────────────────
             # DAPO/BAPO/SGRPO skip groups where all rewards are identical
             # (advantages would be zero). Checking here — before the
@@ -613,24 +664,13 @@ class BaseTrainer:
             # falls through to _run_loss -> None, where _zero_backward keeps
             # the collectives in lockstep. (Multi-GPU nodes have the VRAM
             # headroom the early exit exists to save.)
-            if (self.accelerator is None
-                    and self.algorithm in ("dapo", "bapo", "sgrpo")
-                    and dapo_loss.is_degenerate_group(rewards)):
+            if self.accelerator is None and is_degenerate:
                 if self._is_main:
                     log_degenerate_group(step)
                 if step % 10 == 0:
                     print(f"Step {step}: degenerate group "
                           f"(all same reward), skipping.")
                 continue
-
-            # ── Response statistics ──────────────────────────────────────
-            generated_ids = rollout_data["generated_ids"].to(self.device)
-            prompt_len = rollout_data["prompt_len"]
-            gen_len = generated_ids.shape[1] - prompt_len
-
-            response_stats = self._compute_response_stats(
-                rollout_data["generated_texts"], generated_ids, prompt_len
-            )
 
             # ── Optimization phase ───────────────────────────────────────
             # Inner optimization epochs (PPO-style rollout-batch reuse):
@@ -805,7 +845,12 @@ class BaseTrainer:
                             step=step,
                             algorithm=self.algorithm,
                             loss=loss.item(),
-                            policy_loss=loss.item(),
+                            policy_loss=algo_metrics.get(
+                                f"{self.algorithm}/policy_loss", loss.item()
+                            ),
+                            kl_loss=algo_metrics.get(
+                                f"{self.algorithm}/kl_penalty"
+                            ),
                             entropy=entropy,
                             clip_fraction=algo_metrics.get("train/clip_fraction"),
                             approx_kl=algo_metrics.get("train/approx_kl"),
@@ -906,18 +951,20 @@ class BaseTrainer:
 
         # ── Final eval and checkpoint (main process only) ─────────────────
         final_eval = None
+        final_ckpt_path = None
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
         if self._is_main:
             print(f"\nTraining complete. Final step: {self.step}")
             final_eval = self._evaluate(self.step)
-            ckpt_path = self._save_checkpoint(self.step)
+            final_ckpt_path = self._save_checkpoint(self.step)
             if not self.config.no_wandb:
-                log_checkpoint(self.step, self.algorithm, ckpt_path)
+                log_checkpoint(self.step, self.algorithm, final_ckpt_path)
             finish()
 
         return {
             "algorithm": self.algorithm,
             "steps_attempted": self.step + 1 if self.config.steps else 0,
             "final_eval": final_eval,   # None on non-main ranks
+            "final_checkpoint": final_ckpt_path,   # None on non-main ranks
         }

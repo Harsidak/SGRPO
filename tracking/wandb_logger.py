@@ -111,6 +111,7 @@ def init_run(
 
     # Define custom x-axis for clarity
     wandb.define_metric("train/*", step_metric="sys/step")
+    wandb.define_metric("rollout/*", step_metric="sys/step")
     wandb.define_metric("eval/*", step_metric="sys/step")
     wandb.define_metric("system/*", step_metric="sys/step")
     wandb.define_metric("hist/*", step_metric="sys/step")
@@ -139,6 +140,64 @@ def _save_code_snapshot():
                 relpath = os.path.relpath(filepath, project_root)
                 artifact.add_file(filepath, name=relpath)
     wandb.log_artifact(artifact)
+
+
+def log_rollout(
+    step: int,
+    algorithm: str,
+    # ── Reward statistics (from the rollout group) ───────────────────────
+    reward_mean: float,
+    reward_std: float,
+    reward_max: float,
+    reward_min: float,
+    reward_positive_fraction: Optional[float] = None,
+    # ── Response statistics ──────────────────────────────────────────────
+    response_length_mean: Optional[float] = None,
+    response_length_std: Optional[float] = None,
+    response_length_max: Optional[float] = None,
+    response_length_min: Optional[float] = None,
+    unique_tokens_ratio: Optional[float] = None,
+    # ── Rollout phase timing / meta ──────────────────────────────────────
+    generation_time: Optional[float] = None,
+    group_size: Optional[int] = None,
+    is_degenerate: bool = False,
+) -> None:
+    """
+    Log rollout-phase RL metrics for EVERY training step — including steps
+    that are subsequently skipped as degenerate groups.
+
+    log_step() only fires when an optimizer update happens; early in
+    training (untrained model, all-zero rewards) nearly every dapo/bapo/
+    sgrpo step is degenerate, so without this function the W&B run shows
+    almost nothing but system/GPU metrics. rollout/* charts fill that gap:
+    reward signal, response lengths, and degenerate rate are visible from
+    step 0 regardless of whether the optimization phase ran.
+    """
+    if not _run_active and _local_sink is None:
+        return
+
+    payload = {
+        "sys/step": step,
+        "sys/algorithm": algorithm,
+        "rollout/reward_mean": reward_mean,
+        "rollout/reward_std": reward_std,
+        "rollout/reward_max": reward_max,
+        "rollout/reward_min": reward_min,
+        "rollout/reward_positive_fraction": reward_positive_fraction,
+        "rollout/response_length_mean": response_length_mean,
+        "rollout/response_length_std": response_length_std,
+        "rollout/response_length_max": response_length_max,
+        "rollout/response_length_min": response_length_min,
+        "rollout/unique_tokens_ratio": unique_tokens_ratio,
+        "rollout/generation_time": generation_time,
+        "rollout/group_size": group_size,
+        "rollout/is_degenerate": int(is_degenerate),
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    _local_log("rollout", payload)
+    if _run_active:
+        wandb.log(payload)
 
 
 def log_step(
@@ -258,7 +317,11 @@ def log_step(
 
     _local_log("step", payload)
     if _run_active:
-        wandb.log(payload, step=step)
+        # No explicit step= — every chart uses sys/step via define_metric.
+        # Mixing explicit steps with step-less calls (log_run_metadata) makes
+        # wandb silently drop any log whose step is behind its internal
+        # counter, which is how early-run RL metrics went missing.
+        wandb.log(payload)
 
 
 def log_run_metadata(algorithm: str, arch: str, arch_branch: str) -> None:
@@ -301,7 +364,7 @@ def log_degenerate_group(step: int):
     }
     _local_log("degenerate", payload)
     if _run_active:
-        wandb.log(payload, step=step)
+        wandb.log(payload)
 
 
 def log_histograms(
@@ -344,7 +407,7 @@ def log_histograms(
             token_probs.detach().cpu().float().numpy()
         )
 
-    wandb.log(payload, step=step)
+    wandb.log(payload)
 
 
 def log_eval(
@@ -388,7 +451,7 @@ def log_eval(
     payload = {k: v for k, v in payload.items() if v is not None}
     _local_log("eval", payload)
     if _run_active:
-        wandb.log(payload, step=step)
+        wandb.log(payload)
 
 
 def log_sample_table(
@@ -415,7 +478,7 @@ def log_sample_table(
             s.get("response_length", 0),
         )
 
-    wandb.log({"eval/samples": table}, step=step)
+    wandb.log({"eval/samples": table, "sys/step": step})
 
 
 def log_checkpoint(

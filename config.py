@@ -122,6 +122,10 @@ class TrainingConfig:
 
     # ── Paths ────────────────────────────────────────────────────────────────
     checkpoint_dir: str = "checkpoints"
+    # Include optimizer state in checkpoints (needed to resume training).
+    # The benchmark disables this: its checkpoints exist only for test-set
+    # evaluation, and AdamW state roughly triples the file size.
+    save_optimizer_state: bool = True
 
     def __post_init__(self):
         """Enforce algorithm-specific constraints."""

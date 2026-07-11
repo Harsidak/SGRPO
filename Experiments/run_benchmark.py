@@ -60,10 +60,13 @@ def run_single_experiment(
     model_name: str,
     dataset_name: str,
     no_wandb: bool = False,
+    checkpoint_dir: str = os.path.join("Experiments", "results", "checkpoints"),
 ) -> dict:
     """
     Run a single algorithm with a single seed.
-    Returns a summary dict with the run's headline results.
+    Returns a summary dict with the run's headline results, including the
+    path of the final model checkpoint (for later test-set evaluation via
+    Experiments/evaluate_checkpoint.py).
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -75,12 +78,18 @@ def run_single_experiment(
         device=device,
         model_name=model_name,
         dataset=dataset_name,
-        run_name=f"bench_{algorithm}_seed{seed}_{timestamp}",
+        # W&B run and checkpoint filenames both prepend "{algorithm}_",
+        # so the run_name itself only carries the bench tag + seed.
+        run_name=f"bench_seed{seed}_{timestamp}",
         wandb_project="rl-algo-comparison-2026",
         no_wandb=no_wandb,
         eval_every=50,
         eval_samples=50,
         checkpoint_every=steps,  # checkpoint only at end
+        checkpoint_dir=checkpoint_dir,
+        # Benchmark checkpoints exist for test-set evaluation, not resuming;
+        # dropping AdamW state keeps 25 runs' checkpoints ~3x smaller.
+        save_optimizer_state=False,
     )
 
     set_deterministic_seeds(seed, config.deterministic)
@@ -129,6 +138,7 @@ def run_single_experiment(
         "final_average_reward": final_eval.get("average_reward"),
         "final_correct": final_eval.get("correct"),
         "final_total": final_eval.get("total"),
+        "final_checkpoint": summary.get("final_checkpoint"),
         "total_time_seconds": total_time,
         "error": None,
     }
@@ -345,6 +355,7 @@ def main():
                     model_name=args.model_name,
                     dataset_name=args.dataset,
                     no_wandb=args.no_wandb,
+                    checkpoint_dir=os.path.join(args.output_dir, "checkpoints"),
                 )
             except Exception as exc:  # one bad run must not kill the sweep
                 traceback.print_exc()
@@ -354,7 +365,8 @@ def main():
                     "steps": args.steps, "model_name": args.model_name,
                     "dataset": args.dataset, "final_accuracy": None,
                     "final_average_reward": None, "final_correct": None,
-                    "final_total": None, "total_time_seconds": None,
+                    "final_total": None, "final_checkpoint": None,
+                    "total_time_seconds": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             runs.append(result)
@@ -405,6 +417,12 @@ def main():
         print(f"\n  {len(failed)} run(s) FAILED:")
         for r in failed:
             print(f"    {r['algorithm']} seed={r['seed']}: {r['error']}")
+
+    print(f"\n  Model checkpoints saved in: "
+          f"{os.path.join(args.output_dir, 'checkpoints')}")
+    print("  Evaluate any of them on the test set with:")
+    print("    python -m Experiments.evaluate_checkpoint "
+          f"--results {results_path} --eval_samples 200")
 
 
 if __name__ == "__main__":
