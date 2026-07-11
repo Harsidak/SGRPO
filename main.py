@@ -64,7 +64,12 @@ def get_args():
     parser.add_argument("--batch_size", type=int,   default=1,
                         help="Prompts per step. Keep at 1 for 6GB VRAM.")
     parser.add_argument("--grad_accum", type=int,   default=8,
-                        help="Gradient accumulation steps.")
+                        help="Gradient accumulation steps (across prompts).")
+    parser.add_argument("--inner_epochs", type=int, default=1,
+                        help="PPO-style inner optimization epochs: reuse each "
+                             "rollout batch mu times. 1 = legacy single pass "
+                             "(ratio/Future-KL trivial); 2-4 recommended for "
+                             "real runs so theta moves between passes.")
     parser.add_argument("--clip_eps",   type=float, default=0.2)
     parser.add_argument("--temperature", type=float, default=1.0)
 

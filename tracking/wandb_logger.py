@@ -17,6 +17,7 @@ All logging goes through this module's functions.
 """
 
 import os
+import json
 import time
 import logging
 from typing import Optional
@@ -33,6 +34,54 @@ _run_active = False
 _grad_clip_count = 0
 _degenerate_group_count = 0
 _total_groups = 0
+
+# Local JSONL metrics sink. Independent of W&B: active for --no_wandb runs
+# (where it is the only record) and alongside W&B runs. One JSON object per
+# line, tagged with a "kind" field (metadata / step / degenerate / eval).
+# Experiments/local_benchmark.py consumes these files to build offline
+# comparison graphs, so every algorithm writes the same schema here that it
+# sends to W&B.
+_local_sink = None
+_local_sink_path = None
+
+
+def init_local_sink(
+    algorithm: str,
+    run_name: str,
+    out_dir: Optional[str] = None,
+) -> str:
+    """
+    Open a local JSONL metrics file for this run.
+
+    out_dir precedence: explicit arg > SGRPO_LOCAL_LOG_DIR env var (set by
+    Experiments/local_benchmark.py to group one benchmark's runs together) >
+    Experiments/results/local_logs.
+    """
+    global _local_sink, _local_sink_path
+    if out_dir is None:
+        out_dir = os.environ.get(
+            "SGRPO_LOCAL_LOG_DIR",
+            os.path.join("Experiments", "results", "local_logs"),
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    _local_sink_path = os.path.join(
+        out_dir, f"{algorithm}_{run_name}_{stamp}.jsonl"
+    )
+    _local_sink = open(_local_sink_path, "a", encoding="utf-8")
+    return _local_sink_path
+
+
+def _local_log(kind: str, payload: dict) -> None:
+    """Append one record to the local sink, keeping JSON-safe scalars only."""
+    if _local_sink is None:
+        return
+    record = {"kind": kind, "wall_time": time.time()}
+    for k, v in payload.items():
+        if v is None or isinstance(v, (int, float, str, bool)):
+            record[k] = v
+    _local_sink.write(json.dumps(record) + "\n")
+    _local_sink.flush()
 
 
 def init_run(
@@ -142,7 +191,7 @@ def log_step(
     The WandB column still exists for cross-run comparison alignment.
     """
     global _grad_clip_count, _total_groups
-    if not _run_active:
+    if not _run_active and _local_sink is None:
         return
 
     _total_groups += 1
@@ -207,7 +256,37 @@ def log_step(
     # Remove None values to keep WandB clean but preserve schema
     payload = {k: v for k, v in payload.items() if v is not None}
 
-    wandb.log(payload, step=step)
+    _local_log("step", payload)
+    if _run_active:
+        wandb.log(payload, step=step)
+
+
+def log_run_metadata(algorithm: str, arch: str, arch_branch: str) -> None:
+    """
+    Log one-time run metadata at trainer start.
+
+    Records the detected model architecture and which rollout branch the run
+    took, so W&B captures the control-vs-treatment condition per run:
+      - arch_branch == "isolated": SGRPO on an SSM/hybrid model — state
+        isolation active (the treatment).
+      - arch_branch == "standard": SGRPO on a stateless transformer —
+        isolation is a no-op, degenerates to GRPO (the paper's control), OR
+        any non-SGRPO algorithm.
+
+    Logged once (not per step), so it uses W&B's default step counter.
+    """
+    payload = {
+        "sys/architecture": arch,
+        "sys/architecture_branch": arch_branch,
+        "sys/algorithm": algorithm,
+    }
+    _local_log("metadata", payload)
+    if not _run_active:
+        return
+    wandb.log({
+        "sys/architecture": arch,
+        "sys/architecture_branch": arch_branch,
+    })
 
 
 def log_degenerate_group(step: int):
@@ -216,11 +295,13 @@ def log_degenerate_group(step: int):
     _degenerate_group_count += 1
     _total_groups += 1
 
+    payload = {
+        "train/degenerate_group_rate": _degenerate_group_count / max(_total_groups, 1),
+        "sys/step": step,
+    }
+    _local_log("degenerate", payload)
     if _run_active:
-        wandb.log({
-            "train/degenerate_group_rate": _degenerate_group_count / max(_total_groups, 1),
-            "sys/step": step,
-        }, step=step)
+        wandb.log(payload, step=step)
 
 
 def log_histograms(
@@ -285,7 +366,7 @@ def log_eval(
     kl_from_ref: Optional[float] = None,
 ) -> None:
     """Log evaluation metrics on held-out test set."""
-    if not _run_active:
+    if not _run_active and _local_sink is None:
         return
 
     payload = {
@@ -305,7 +386,9 @@ def log_eval(
     }
 
     payload = {k: v for k, v in payload.items() if v is not None}
-    wandb.log(payload, step=step)
+    _local_log("eval", payload)
+    if _run_active:
+        wandb.log(payload, step=step)
 
 
 def log_sample_table(
@@ -355,8 +438,12 @@ def log_checkpoint(
 
 
 def finish() -> None:
-    """Finish the current W&B run."""
-    global _run_active
+    """Finish the current W&B run and close the local metrics sink."""
+    global _run_active, _local_sink
+    if _local_sink is not None:
+        _local_sink.close()
+        _local_sink = None
+        logger.info(f"Local metrics written: {_local_sink_path}")
     if _run_active:
         wandb.finish()
         _run_active = False

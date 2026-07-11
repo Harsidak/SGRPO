@@ -64,6 +64,14 @@ class TrainingConfig:
     batch_size: int = 1       # prompts per step (keep 1 for 6GB VRAM)
     grad_accum: int = 8       # gradient accumulation steps
     warmup_steps: int = 0
+    # PPO-style inner optimization epochs: reuse each rollout batch mu times.
+    # mu == 1 (default) is the legacy single-pass behavior (bit-identical).
+    # mu > 1 re-optimizes the same rollouts, stepping the optimizer after each
+    # inner epoch so theta moves — this is what makes the importance ratio and
+    # Future-KL non-trivial (with mu == 1 they are identically 1.0 / 0.0).
+    # Default kept at 1 for backward compatibility; 2-4 recommended for real
+    # runs (see sgrpo_research_roadmap.md Fix 3).
+    inner_epochs: int = 1
 
     # ── RL ────────────────────────────────────────────────────────────────────
     group_size: int = 4       # G — rollouts per prompt (1 for PPO)

@@ -31,8 +31,9 @@ from torch.optim import AdamW
 
 from rewards.gsm8k_reward import compute_group_rewards
 from tracking.wandb_logger import (
-    init_run, log_step, log_eval, log_histograms,
-    log_sample_table, log_checkpoint, log_degenerate_group, finish,
+    init_run, init_local_sink, log_step, log_eval, log_histograms,
+    log_sample_table, log_checkpoint, log_degenerate_group,
+    log_run_metadata, finish,
 )
 
 # Import loss modules (not wildcard — each exports compute())
@@ -41,6 +42,9 @@ from losses import ppo_loss, grpo_loss, dapo_loss, bapo_loss, sgrpo_loss
 # Import rollout generators
 from rollouts.base_rollout import generate_rollouts
 from rollouts.sgrpo_rollout import generate_rollouts_isolated
+
+# Architecture detection is authoritative for rollout routing (see __init__).
+from models.load_model import detect_architecture
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +59,27 @@ class BaseTrainer:
     """
 
     def __init__(self, model, tokenizer, train_dataset, eval_dataset,
-                 algorithm: str, config, arch: str = "ssm"):
+                 algorithm: str, config, arch: str | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.algorithm = algorithm
         self.config = config
+
+        # ── Architecture detection (authoritative) ───────────────────────
+        # Rollout routing MUST be driven by the model's actual architecture,
+        # never by a caller-supplied string or the algorithm name. A stale or
+        # missing `arch` would route a stateless transformer into the SSM-only
+        # isolated generator, whose _snapshot_ssm_states() raises when it finds
+        # no recurrent state. Detecting here (before accelerator.prepare(), so
+        # the module is still bare and unwrapped) makes every entry point
+        # correct even if it never passed `arch`. The optional `arch` argument
+        # is kept for backward compatibility but the detected value wins.
+        detected_arch = detect_architecture(model)
+        if arch is not None and arch != detected_arch:
+            print(f"Note: caller passed arch={arch!r} but the model is "
+                  f"{detected_arch!r} — using detected value for routing.")
 
         # Reward comes from the dataset (BaseRewardDataset interface) so the
         # trainer works on any verifiable benchmark. Plain datasets without
@@ -72,7 +90,7 @@ class BaseTrainer:
         self._eval_reward_fn = getattr(
             eval_dataset, "compute_group_rewards", compute_group_rewards
         )
-        self.arch = arch
+        self.arch = detected_arch
         self.step = 0
 
         # ── Optional multi-GPU via HuggingFace Accelerate ────────────────
@@ -98,14 +116,20 @@ class BaseTrainer:
         # across generations (SSM and hybrid SSM+attention). Transformers are
         # stateless between generate() calls, so SGRPO degenerates to GRPO —
         # which is exactly the paper's control condition.
-        if algorithm == "sgrpo" and arch in ("ssm", "hybrid"):
+        if algorithm == "sgrpo" and self.arch in ("ssm", "hybrid"):
             self.rollout_fn = generate_rollouts_isolated
+            self.arch_branch = "isolated"
+            print(f"SGRPO: architecture={self.arch}, using isolated rollouts "
+                  f"(SSM state isolation active).")
         elif algorithm == "sgrpo":
-            print("WARNING: SGRPO state isolation is unnecessary for "
-                  "transformers — using standard rollouts (control condition).")
             self.rollout_fn = generate_rollouts
+            self.arch_branch = "standard"
+            print(f"SGRPO: architecture={self.arch}, using standard rollouts "
+                  f"(state isolation not applicable — degenerates to GRPO, "
+                  f"the paper's control condition).")
         else:
             self.rollout_fn = generate_rollouts
+            self.arch_branch = "standard"
 
         # Optimizer — same for all algorithms
         self.optimizer = AdamW(
@@ -156,6 +180,12 @@ class BaseTrainer:
         self._all_response_lengths = []
         self._sample_buffer = []     # for sample generation tables
 
+        # Inner optimization epochs (PPO-style rollout-batch reuse). mu == 1
+        # is the legacy single-pass path; mu > 1 steps the optimizer after
+        # every inner epoch so theta moves between passes. See train().
+        self._inner_epochs = max(1, int(getattr(config, "inner_epochs", 1)))
+        self._global_update = 0      # monotonic optimizer-step counter
+
         # W&B init — main process only under multi-GPU
         if not config.no_wandb and self._is_main:
             init_run(
@@ -164,14 +194,26 @@ class BaseTrainer:
                 config=config.to_dict(),
                 project=config.wandb_project,
             )
+        # Local JSONL metrics sink — always on (main process), so every run
+        # (including --no_wandb smoke tests) leaves a structured metrics
+        # record that Experiments/local_benchmark.py can graph offline.
+        if self._is_main:
+            local_path = init_local_sink(algorithm, config.run_name)
+            print(f"Local metrics log: {local_path}")
+            # One-time: record architecture + rollout branch (control vs
+            # treatment) so both sinks capture the condition for each run.
+            log_run_metadata(algorithm, self.arch, self.arch_branch)
 
         # Checkpoint dir
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
         if self._is_main:
-            print(f"Trainer initialized: {algorithm.upper()} | arch: {arch}")
+            print(f"Trainer initialized: {algorithm.upper()} | arch: {self.arch}")
             print(f"Rollout generator: "
                   f"{'isolated (SGRPO)' if self.rollout_fn is generate_rollouts_isolated else 'standard'}")
+            print(f"Inner epochs (mu): {self._inner_epochs}"
+                  + ("" if self._inner_epochs > 1 else "  (legacy single-pass;"
+                     " ratio/Future-KL are trivial at mu=1)"))
             if self.accelerator is not None:
                 print(f"Accelerate: {self.accelerator.num_processes} "
                       f"process(es), device {self.device}, "
@@ -453,7 +495,7 @@ class BaseTrainer:
         import numpy as np
         lengths_arr = np.array(all_lengths)
 
-        if not self.config.no_wandb:
+        if self._is_main:
             log_eval(
                 step=step,
                 algorithm=self.algorithm,
@@ -574,7 +616,7 @@ class BaseTrainer:
             if (self.accelerator is None
                     and self.algorithm in ("dapo", "bapo", "sgrpo")
                     and dapo_loss.is_degenerate_group(rewards)):
-                if not self.config.no_wandb:
+                if self._is_main:
                     log_degenerate_group(step)
                 if step % 10 == 0:
                     print(f"Step {step}: degenerate group "
@@ -591,6 +633,30 @@ class BaseTrainer:
             )
 
             # ── Optimization phase ───────────────────────────────────────
+            # Inner optimization epochs (PPO-style rollout-batch reuse):
+            #
+            #   rollouts are generated ONCE per outer step above (old_log_probs
+            #   fixed at rollout-time theta). We then re-optimize that same
+            #   batch `mu` times. old_log_probs stays fixed across all mu inner
+            #   passes; only new_log_probs is recomputed each pass because
+            #   theta has moved. At inner_epoch 0 theta == theta_old, so
+            #   ratio == 1 and Future-KL == 0 (identical to the single-pass
+            #   trainer); from inner_epoch 1 onward theta has been stepped, so
+            #   the importance ratio and Future-KL become non-trivial — the
+            #   entire point of Fix 3.
+            #
+            # Composition with grad_accum (they are orthogonal in intent but
+            # both gate the optimizer step, so the reconciliation is explicit,
+            # never silent):
+            #   - mu == 1 (default): LEGACY path. Gradients accumulate across
+            #     `grad_accum` consecutive PROMPTS; one optimizer step per
+            #     grad_accum prompts. Bit-identical to the pre-Fix-3 trainer.
+            #   - mu > 1: theta MUST move between inner epochs or the reuse is
+            #     pointless (new_log_probs would equal old_log_probs), so the
+            #     optimizer steps after EVERY inner epoch and grad_accum's
+            #     cross-prompt accumulation is not applied (each pass divides by
+            #     1 and steps). The step count is visible in the console/W&B via
+            #     sys/global_update and sys/inner_epoch.
             self.model.train()
 
             old_log_probs = rollout_data["old_log_probs"].to(self.device)
@@ -611,168 +677,220 @@ class BaseTrainer:
                 )
                 old_log_probs = torch.cat([old_log_probs, pad], dim=1)
 
-            # Forward pass — compute new log probs + entropy
-            new_log_probs, entropy = self._compute_new_log_probs_and_entropy(
-                generated_ids, prompt_len
-            )
-
-            # Reference log probs for KL penalty (ppo/grpo/bapo only)
+            # Reference log probs for KL penalty (ppo/grpo/bapo only). The
+            # reference model is frozen, so ref_log_probs are theta-independent
+            # — compute ONCE and reuse across all inner epochs.
             ref_log_probs = (
                 self._compute_ref_log_probs(generated_ids, prompt_len)
                 if self._ref_model is not None else None
             )
 
-            # Compute loss
-            result = self._run_loss(
-                new_log_probs, old_log_probs, rewards, attention_mask,
-                ref_log_probs=ref_log_probs,
-            )
+            mu = self._inner_epochs
+            step_every_pass = mu > 1
+            loss_divisor = 1.0 if step_every_pass else self.config.grad_accum
 
-            if result is None:
-                # Degenerate group — skip this step.
+            for inner_epoch in range(mu):
+                # Forward pass under the CURRENT policy (theta may have been
+                # stepped by a previous inner epoch).
+                new_log_probs, entropy = self._compute_new_log_probs_and_entropy(
+                    generated_ids, prompt_len
+                )
+
+                result = self._run_loss(
+                    new_log_probs, old_log_probs, rewards, attention_mask,
+                    ref_log_probs=ref_log_probs,
+                )
+
+                # ── Skip paths: degenerate group or non-finite loss ──────
+                # Single-GPU: dapo/bapo/sgrpo degenerate groups are already
+                # filtered before this loop, so `result is None` here only
+                # happens under Accelerate (early exit disabled to keep DDP
+                # collectives aligned). Non-finite losses are guarded for all.
+                bad_reason = None
+                if result is None:
+                    bad_reason = "degenerate"
+                elif not torch.isfinite(result[0]):
+                    bad_reason = "non-finite"
+
+                if bad_reason is not None:
+                    if self.accelerator is not None:
+                        # Zero contribution keeps DDP in lockstep; every rank
+                        # runs exactly mu passes with an identical step cadence.
+                        self._zero_backward(new_log_probs)
+                        accumulation_count += 1
+                        if step_every_pass or (
+                            accumulation_count % self.config.grad_accum == 0
+                        ):
+                            self._clip_grads()
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            self._global_update += 1
+                    else:
+                        # Single-GPU: free the graph, take no step. For mu == 1
+                        # this reproduces the legacy non-finite reset exactly.
+                        self.optimizer.zero_grad()
+                        if not step_every_pass:
+                            accumulation_count = 0
+                    if bad_reason == "degenerate":
+                        if self._is_main:
+                            log_degenerate_group(step)
+                        if step % 10 == 0 and self._is_main:
+                            print(f"Step {step}: degenerate group "
+                                  f"(all same reward), skipping.")
+                    elif self._is_main:
+                        print(f"Step {step} (inner {inner_epoch}): non-finite "
+                              f"loss, skipping update.")
+                    del new_log_probs, entropy
+                    if result is not None:
+                        del result
+                    continue
+
+                loss, advantages, algo_metrics = result
+
+                # ── Accumulate tracking data for histograms ──────────────
+                with torch.no_grad():
+                    ratio = torch.exp(
+                        (new_log_probs - old_log_probs).clamp(-20.0, 20.0)
+                    )
+                    self._all_rewards.append(rewards.detach().cpu())
+                    self._all_advantages.append(advantages.detach().cpu())
+                    self._all_ratios.append(ratio.detach().cpu().flatten())
+                    self._all_response_lengths.extend(
+                        response_stats["raw_lengths"]
+                    )
+
+                # Scale loss (grad_accum for the legacy mu==1 path; 1 when
+                # stepping every inner pass).
+                scaled_loss = loss / loss_divisor
                 if self.accelerator is not None:
-                    # Contribute a zero gradient so DDP stays in lockstep;
-                    # backward also frees the forward graph.
-                    self._zero_backward(new_log_probs)
-                    accumulation_count += 1
-                    self._step_if_boundary(accumulation_count)
-                # Drop the references to the forward pass so its autograd
-                # graph is freed NOW; with no backward() done (single-GPU
-                # path), holding it through the next step's forward doubles
-                # peak VRAM.
-                del new_log_probs, entropy
-                if not self.config.no_wandb and self._is_main:
-                    log_degenerate_group(step)
-                if step % 10 == 0:
-                    print(f"Step {step}: degenerate group (all same reward), skipping.")
-                continue
-
-            loss, advantages, algo_metrics = result
-
-            # Defensive guard: never let a non-finite loss reach the
-            # optimizer — one NaN step corrupts the weights permanently.
-            if not torch.isfinite(loss):
-                print(f"Step {step}: non-finite loss ({loss.item()}), "
-                      f"skipping update.")
-                if self.accelerator is not None:
-                    # Zero contribution, collectives stay aligned. Do NOT
-                    # zero_grad or reset the counter here — both are shared
-                    # state that must stay identical across ranks.
-                    self._zero_backward(new_log_probs)
-                    del loss, new_log_probs, entropy
-                    accumulation_count += 1
-                    self._step_if_boundary(accumulation_count)
+                    self.accelerator.backward(scaled_loss)
                 else:
-                    del loss, new_log_probs, entropy  # free autograd graph
+                    scaled_loss.backward()
+
+                accumulation_count += 1
+                do_step = step_every_pass or (
+                    accumulation_count % self.config.grad_accum == 0
+                )
+
+                if do_step:
+                    # Gradient clipping
+                    grad_norm = self._clip_grads()
+                    grad_was_clipped = grad_norm > self.config.max_grad_norm
+
+                    self.optimizer.step()
                     self.optimizer.zero_grad()
-                    accumulation_count = 0
-                continue
+                    self._global_update += 1
 
-            # ── Accumulate tracking data for histograms ──────────────────
-            with torch.no_grad():
-                ratio = torch.exp(
-                    (new_log_probs - old_log_probs).clamp(-20.0, 20.0)
-                )
-                self._all_rewards.append(rewards.detach().cpu())
-                self._all_advantages.append(advantages.detach().cpu())
-                self._all_ratios.append(ratio.detach().cpu().flatten())
-                self._all_response_lengths.extend(
-                    response_stats["raw_lengths"]
-                )
+                    step_time = time.time() - step_start_time
 
-            # Scale loss for gradient accumulation
-            scaled_loss = loss / self.config.grad_accum
-            if self.accelerator is not None:
-                self.accelerator.backward(scaled_loss)
-            else:
-                scaled_loss.backward()
-
-            accumulation_count += 1
-
-            if accumulation_count % self.config.grad_accum == 0:
-                # Gradient clipping
-                grad_norm = self._clip_grads()
-
-                grad_was_clipped = grad_norm > self.config.max_grad_norm
-
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-                step_time = time.time() - step_start_time
-
-                # Throughput: tokens processed per second
-                total_tokens = (
-                    self.config.group_size * gen_len
-                )
-                throughput = total_tokens / max(step_time, 1e-6)
-
-                # ── WandB logging (main process only) ────────────────────
-                if not self.config.no_wandb and self._is_main:
-                    log_step(
-                        step=step,
-                        algorithm=self.algorithm,
-                        loss=loss.item(),
-                        policy_loss=loss.item(),
-                        entropy=entropy,
-                        clip_fraction=algo_metrics.get("train/clip_fraction"),
-                        approx_kl=algo_metrics.get("train/approx_kl"),
-                        ratio_mean=algo_metrics.get("train/ratio_mean"),
-                        ratio_std=algo_metrics.get("train/ratio_std"),
-                        ratio_max=algo_metrics.get("train/ratio_max"),
-                        ratio_min=algo_metrics.get("train/ratio_min"),
-                        reward_mean=rewards.mean().item(),
-                        reward_std=rewards.std().item(),
-                        reward_max=rewards.max().item(),
-                        reward_min=rewards.min().item(),
-                        advantage_mean=advantages.mean().item(),
-                        advantage_std=advantages.std().item(),
-                        advantage_max=advantages.max().item(),
-                        advantage_min=advantages.min().item(),
-                        positive_advantage_ratio=algo_metrics.get(
-                            "train/positive_advantage_ratio"
-                        ),
-                        grad_norm=grad_norm,
-                        grad_was_clipped=grad_was_clipped,
-                        response_length_mean=response_stats["response_length_mean"],
-                        response_length_std=response_stats["response_length_std"],
-                        response_length_max=response_stats["response_length_max"],
-                        response_length_min=response_stats["response_length_min"],
-                        unique_tokens_ratio=response_stats["unique_tokens_ratio"],
-                        step_time=step_time,
-                        generation_time=generation_time,
-                        throughput=throughput,
-                        algo_metrics={
-                            k: v for k, v in algo_metrics.items()
-                            if not k.startswith("train/")
-                        },
+                    # Throughput: tokens processed per second
+                    total_tokens = (
+                        self.config.group_size * gen_len
                     )
+                    throughput = total_tokens / max(step_time, 1e-6)
 
-                    # Histogram logging
-                    if step % self.config.histogram_every == 0 and step > 0:
-                        if self._all_advantages:
-                            log_histograms(
-                                step=step,
-                                advantages=torch.cat(self._all_advantages),
-                                rewards=torch.cat(self._all_rewards),
-                                ratios=torch.cat(self._all_ratios),
-                                response_lengths=self._all_response_lengths.copy(),
+                    # Per-inner-epoch diagnostics ride along in the algo-metric
+                    # passthrough so Future-KL's signal (zero on inner_epoch 0,
+                    # nonzero afterwards) is visible in W&B.
+                    passthrough = {
+                        k: v for k, v in algo_metrics.items()
+                        if not k.startswith("train/")
+                    }
+                    passthrough["sys/inner_epoch"] = inner_epoch
+                    passthrough["sys/global_update"] = self._global_update
+
+                    # ── Metrics logging: W&B + local JSONL (main only) ───
+                    if self._is_main:
+                        log_step(
+                            step=step,
+                            algorithm=self.algorithm,
+                            loss=loss.item(),
+                            policy_loss=loss.item(),
+                            entropy=entropy,
+                            clip_fraction=algo_metrics.get("train/clip_fraction"),
+                            approx_kl=algo_metrics.get("train/approx_kl"),
+                            ratio_mean=algo_metrics.get("train/ratio_mean"),
+                            ratio_std=algo_metrics.get("train/ratio_std"),
+                            ratio_max=algo_metrics.get("train/ratio_max"),
+                            ratio_min=algo_metrics.get("train/ratio_min"),
+                            reward_mean=rewards.mean().item(),
+                            reward_std=rewards.std().item(),
+                            reward_max=rewards.max().item(),
+                            reward_min=rewards.min().item(),
+                            advantage_mean=advantages.mean().item(),
+                            advantage_std=advantages.std().item(),
+                            advantage_max=advantages.max().item(),
+                            advantage_min=advantages.min().item(),
+                            positive_advantage_ratio=algo_metrics.get(
+                                "train/positive_advantage_ratio"
+                            ),
+                            grad_norm=grad_norm,
+                            grad_was_clipped=grad_was_clipped,
+                            response_length_mean=response_stats["response_length_mean"],
+                            response_length_std=response_stats["response_length_std"],
+                            response_length_max=response_stats["response_length_max"],
+                            response_length_min=response_stats["response_length_min"],
+                            unique_tokens_ratio=response_stats["unique_tokens_ratio"],
+                            step_time=step_time,
+                            generation_time=generation_time,
+                            throughput=throughput,
+                            algo_metrics=passthrough,
+                        )
+
+                        # Histogram logging
+                        if step % self.config.histogram_every == 0 and step > 0:
+                            if self._all_advantages:
+                                log_histograms(
+                                    step=step,
+                                    advantages=torch.cat(self._all_advantages),
+                                    rewards=torch.cat(self._all_rewards),
+                                    ratios=torch.cat(self._all_ratios),
+                                    response_lengths=self._all_response_lengths.copy(),
+                                )
+                                # Reset buffers
+                                self._all_rewards.clear()
+                                self._all_advantages.clear()
+                                self._all_ratios.clear()
+                                self._all_response_lengths.clear()
+
+                    # ── Console output ───────────────────────────────────
+                    if step % 10 == 0 and self._is_main:
+                        if mu > 1:
+                            # Richer line surfaces the per-inner-epoch signal
+                            # that Fix 3 activates.
+                            clipf = algo_metrics.get("train/clip_fraction")
+                            clip_tag = (f" | ClipFrac: {clipf:.3f}"
+                                        if clipf is not None else "")
+                            sgrpo_tag = ""
+                            if self.algorithm == "sgrpo":
+                                sgrpo_tag = (
+                                    f" | w_std: "
+                                    f"{algo_metrics.get('sgrpo/influence_weight_std', 0.0):.2e}"
+                                )
+                            print(
+                                f"Step {step:4d} [inner {inner_epoch+1}/{mu}] "
+                                f"| Loss: {loss.item():.4f} "
+                                f"| Reward: {rewards.mean().item():.3f} "
+                                f"| Adv: {advantages.mean().item():.3f} "
+                                f"| Entropy: {entropy:.2f} "
+                                f"| GradNorm: {grad_norm:.3f}"
+                                f"{clip_tag}{sgrpo_tag} "
+                                f"| {step_time:.1f}s"
                             )
-                            # Reset buffers
-                            self._all_rewards.clear()
-                            self._all_advantages.clear()
-                            self._all_ratios.clear()
-                            self._all_response_lengths.clear()
+                        else:
+                            # Legacy single-pass console line (unchanged).
+                            print(
+                                f"Step {step:4d} | Loss: {loss.item():.4f} "
+                                f"| Reward: {rewards.mean().item():.3f} "
+                                f"| Adv: {advantages.mean().item():.3f} "
+                                f"| Entropy: {entropy:.2f} "
+                                f"| GradNorm: {grad_norm:.3f} "
+                                f"| {step_time:.1f}s"
+                            )
 
-                # ── Console output ───────────────────────────────────────
-                if step % 10 == 0 and self._is_main:
-                    print(
-                        f"Step {step:4d} | Loss: {loss.item():.4f} "
-                        f"| Reward: {rewards.mean().item():.3f} "
-                        f"| Adv: {advantages.mean().item():.3f} "
-                        f"| Entropy: {entropy:.2f} "
-                        f"| GradNorm: {grad_norm:.3f} "
-                        f"| {step_time:.1f}s"
-                    )
+                # Free this inner pass's forward graph before the next pass /
+                # next step so peak VRAM does not grow with mu.
+                del new_log_probs, entropy, loss, result
 
             # ── Periodic evaluation (main process only) ──────────────────
             if (step > 0 and step % self.config.eval_every == 0
@@ -796,7 +914,7 @@ class BaseTrainer:
             ckpt_path = self._save_checkpoint(self.step)
             if not self.config.no_wandb:
                 log_checkpoint(self.step, self.algorithm, ckpt_path)
-                finish()
+            finish()
 
         return {
             "algorithm": self.algorithm,

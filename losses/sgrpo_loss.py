@@ -195,17 +195,27 @@ def compute(
     # (the "ISO" superscript — isolation happened in the rollout generator)
     advantages = compute_group_advantages(rewards)
 
-    # Importance sampling ratio with numerical stability
+    # Importance sampling ratio with numerical stability.
+    # This DOES require grad: d r_t / d theta is the intended policy gradient.
     log_ratio = (new_log_probs - old_log_probs).clamp(-20.0, 20.0)
     ratio = torch.exp(log_ratio)
 
-    # Future-KL influence weights
-    future_kl = compute_future_kl(
-        new_log_probs, old_log_probs, attention_mask, future_kl_decay
-    )
-    influence_weights = compute_influence_weights(
-        future_kl, future_kl_clip_low, future_kl_clip_high
-    )
+    # Future-KL influence weights.
+    # w_t scales the advantage, so it is an advantage-like coefficient and
+    # MUST be treated as a constant w.r.t. theta — exactly as `advantages`
+    # itself is. Computing it under no_grad both (a) prevents an unintended
+    # second gradient term  r_t · A_i · ∇_θ w_t  from leaking into the policy
+    # gradient wherever the clip is not saturating, and (b) avoids building
+    # the autograd graph for the reverse-cumsum scan at all (nothing to free
+    # later). `ratio` above is built from `new_log_probs` OUTSIDE this block,
+    # so the intended gradient  ∇_θ r_t · A_i · w_t  is fully preserved.
+    with torch.no_grad():
+        future_kl = compute_future_kl(
+            new_log_probs, old_log_probs, attention_mask, future_kl_decay
+        )
+        influence_weights = compute_influence_weights(
+            future_kl, future_kl_clip_low, future_kl_clip_high
+        )
 
     # Weighted advantages: A_i^ISO * w_t
     advantages_expanded = advantages.unsqueeze(1).expand_as(ratio)

@@ -178,6 +178,34 @@ def main():
     check("influence weights within [1.0, 1.2]",
           bool((w >= 1.0 - 1e-6).all() and (w <= 1.2 + 1e-6).all()),
           f"range=[{w.min().item():.4f}, {w.max().item():.4f}]")
+
+    # ── Fix 2: no gradient leak through the influence weights ─────────────
+    # w_t = clip(exp(FutureKL_t)) is advantage-like and MUST be a constant
+    # w.r.t. theta. If compute() built it with grad tracking, loss.backward()
+    # would carry an extra  r_t · A_i · ∇w_t  term and diverge from a
+    # reference that detaches the weights. Verify the two gradients match.
+    nlp_a = (old_lp + 0.1 * torch.randn(G, T, generator=torch.Generator().manual_seed(3))
+             ).requires_grad_(True)
+    loss_a = sgrpo_loss.compute(nlp_a, old_lp, rewards, mask)[0]
+    grad_a = torch.autograd.grad(loss_a, nlp_a)[0]
+
+    # Reference: identical surrogate but the weight path is fed a DETACHED
+    # copy of new_log_probs, so w_t provably cannot backprop into theta.
+    nlp_b = nlp_a.detach().clone().requires_grad_(True)
+    adv_ref = grpo_loss.compute_group_advantages(rewards)
+    ratio_ref = torch.exp((nlp_b - old_lp).clamp(-20.0, 20.0))
+    w_ref = sgrpo_loss.compute_influence_weights(
+        sgrpo_loss.compute_future_kl(nlp_b.detach(), old_lp, mask)
+    )
+    wadv_ref = adv_ref.unsqueeze(1).expand_as(ratio_ref) * w_ref
+    ptl_ref = -torch.min(ratio_ref * wadv_ref,
+                         torch.clamp(ratio_ref, 0.8, 1.2) * wadv_ref)
+    loss_ref = (ptl_ref * mask).sum() / mask.sum().clamp(min=1)
+    grad_ref = torch.autograd.grad(loss_ref, nlp_b)[0]
+
+    leak = (grad_a - grad_ref).abs().max().item()
+    check("no gradient path through influence weights (Fix 2)",
+          leak < 1e-6, f"max_grad_diff={leak:.2e}")
     # Chunked scan must match the naive O(T) reference loop exactly,
     # including across chunk boundaries (gen_len > chunk_size) and for
     # gen_len not divisible by chunk_size.
