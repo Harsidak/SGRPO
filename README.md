@@ -6,7 +6,7 @@ The primary focus is on applying these algorithms to `state-spaces/mamba-130m-hf
 
 ## Environment Setup
 
-This project uses `uv` for dependency management with Python 3.13+.
+This project uses `uv` for dependency management with Python 3.12+.
 
 ```bash
 uv sync
